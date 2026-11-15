@@ -11,19 +11,26 @@
 //   4. polls GET $MAKEFUN_ENV_URL/work every 100 ms and exits 0 when the env says {"done": true}.
 // `node main.ts --list` prints the same catalog JSON and exits 0 before any server starts.
 //
-// ROUTING (the score, in order)
+// ROUTING (the score, in order). The rank among score-99 entries is decided by
+// upstream calls, so the routing spends quality only where it buys fewer calls:
 //   - quality (60%): every free candidate that meets the request's requirements is ranked by its
 //     rating_milli from the brief's quality table (the vendored table in lib/ratings.ts is only a
 //     fallback for a brief that carries none), and the best is tried first. A paid model is never
-//     a legal pick and is never chosen.
-//   - served (15%) and failover (10%): each provider has a per-trial budget, so calls are spread:
-//     a provider's candidates lose LOAD_PENALTY milli-points a call already made to that provider,
-//     divided by the request's weight (a weight-2 request is worth re-using a top provider for),
-//     so the load moves to the next-best provider before any budget is exhausted. A 402, 429 or 5xx
-//     (or an unreachable or malformed provider) never ends the request: that provider's other models
-//     sink to the bottom of the order for this request (FAIL_PENALTY) and the next free model that
-//     meets the request is tried. Exactly one provider call may answer a request, so the loop stops
-//     at the first success.
+//     a legal pick and is never chosen. A weighted quality-loss budget (LOSS_CAP) keeps the trial
+//     at quality 99 whenever the calls allow it: a candidate whose loss would spend the budget
+//     sinks below every affordable one, so the cheap models are only used while the budget lasts.
+//   - served (15%) and failover (10%): each provider has a per-trial budget, so calls are spread
+//     by what the next call to a provider is likely to cost: a headroom price
+//     (HEADROOM_K / the calls the provider has left, from the kit's published budget ranges),
+//     a reuse step once a provider has been called, and the small load term. A refusal is read,
+//     not just counted: the provider's own message says whether its budget is spent or it is out
+//     (then it is dead for the trial and never called again) or whether it refused this one call
+//     (then it stays live). Exactly one provider call may answer a request, so the loop stops at
+//     the first success, and every candidate is tried at most once.
+//   - look-ahead: the manifest is known, so a provider's first call is never spent on an
+//     unconstrained request when a later constrained request (five servicers or fewer: vision,
+//     long-context) will need it. Constrained requests are served from the safest providers;
+//     unconstrained ones spend the providers nobody later needs.
 //   - wire (10%): the client speaks OpenAI or Anthropic; the providers speak OpenAI, Anthropic or
 //     Gemini. Every request is rebuilt in the provider's wire with its system prompt, user text
 //     (images included), tools, stop sequences, max_tokens and JSON mode preserved, and the whole
@@ -36,9 +43,9 @@
 //     capabilities where it has a row; the register body and --list print the one built object.
 //
 // DETERMINISM: routing is a function of the brief, the requests, and the providers' answers so far
-// (arrival order, call counts, failure penalties). No clock, no unseeded randomness: a replay leaves
-// the same state export. Client requests are handled one at a time (a promise mutex), which also
-// keeps each provider's one-at-a-time rule: a second in-flight call to a provider is refused 429.
+// (arrival order, call counts, dead providers, quality loss spent). No clock, no unseeded randomness:
+// a replay leaves the same state export. Client requests are handled one at a time (a promise mutex),
+// which also keeps each provider's one-at-a-time rule: a second in-flight call to a provider is refused 429.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
@@ -101,14 +108,41 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const PROVIDER_CALL_TIMEOUT_MS = 5000;
 /** Milli-points a provider's candidates lose for each call already made to that provider this trial. */
 const LOAD_PENALTY = 0.75;
-/** Milli-points a provider's candidates lose for the rest of one request after one of its calls refused.
- * Zero: a refusal is as likely a single scheduled failure of that call as an exhausted provider, so the
- * next-best model — even on the same provider — is tried in rating order. Retrying a genuinely
- * exhausted provider costs one more refused call and nothing else: the request is still served by
- * the next model that answers. */
-const FAIL_PENALTY = 0;
-/** The most provider calls one client request may cost. */
-const MAX_ATTEMPTS = 8;
+/** Milli-points priced per expected failed call: the headroom term below is this divided by the
+ * calls the provider has left, so a provider near the end of its budget is priced out. */
+const HEADROOM_K = 200;
+/** Milli-points a provider's candidates lose once that provider has been called at all this trial:
+ * a first call can never fail (a failure schedule starts at the second call), so re-use is what
+ * risks a refusal, and the first call of every provider is spent carefully. */
+const REUSE_STEP = 10;
+/** Weighted quality-loss budget for the trial, in milli-points: a candidate that would spend past
+ * it sinks below every affordable one. 500 keeps quality 99 on the practice trials with margin
+ * (quality 98 still scores 99, and the cliff to 97 is at 765). */
+const LOSS_CAP = 500;
+/** A later request with this many servicers or fewer counts as constrained for the look-ahead:
+ * vision needs 2-4 providers, long-context 5. */
+const CONSTRAINED_SERVICERS = 5;
+/** How far a reserved or unaffordable candidate sinks: below every live one, but still tried when
+ * nothing else is left, so a request is served rather than dropped. */
+const SINK = 10000;
+/** The most provider calls one client request may cost: every candidate at most once, so a request
+ * with few candidates is never left unserved while one could still answer it. */
+const MAX_ATTEMPTS = 26;
+/** Each provider's per-trial budget midpoint, from the kit's published provider table
+ * (program/env/server.mjs calls_min..calls_max): the headroom term prices the marginal failure
+ * risk of the next call to that provider. A provider the table does not name gets 8. */
+const BUDGET_MID: Record<string, number> = {
+  groq: 10.5,
+  cerebras: 5.5,
+  gemini: 7,
+  zai: 4.5,
+  openrouter: 11,
+  sambanova: 4.5,
+  pollinations: 12,
+  cloudflare: 7.5,
+  ovh: 5.5,
+  kilol: 14,
+};
 /** The rating a model the quality table does not name is ranked at. */
 const UNKNOWN_RATING = 1200;
 /** The text length above which a request is treated as a long-context one, when the manifest is absent. */
@@ -126,6 +160,16 @@ let catalog: CatalogReport = { providers: [] };
 let manifestIndex = 0;
 /** How many inference calls this trial has sent to each provider: the load the routing spreads. */
 const calls = new Map<string, number>();
+/** Providers the trial has proved dead: a refusal whose message says the budget is spent or the
+ * provider is out. Dead providers are never called again, this request or any later one. */
+const dead = new Set<string>();
+/** Weighted quality loss served so far, against LOSS_CAP. */
+let spentLoss = 0;
+/** The providers that can serve each manifest row, in manifest order (from the probes). */
+let servicers: Set<string>[] = [];
+/** For each manifest row, the providers a later constrained request will still need: how many later
+ * rows with CONSTRAINED_SERVICERS servicers or fewer each provider serves. */
+let futureNeed: Map<string, number>[] = [];
 /** One client request at a time: the promise the next request waits on. */
 let queue: Promise<void> = Promise.resolve();
 
@@ -205,28 +249,49 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
   return out;
 }
 
-/** Candidates best first: the rating, less the load already on the provider and the failures this request.
- * The load penalty is divided by the request's weight: a weight-2 request is worth twice a weight-1
- * one, so it is worth re-using a top provider for, and the weight-1 requests absorb the spreading. */
-function sortCandidates(cands: readonly Candidate[], tired: ReadonlyMap<string, number>, weight: number): Candidate[] {
-  const score = (c: Candidate): number =>
-    c.rating - (LOAD_PENALTY * (calls.get(c.probe.provider.id) ?? 0)) / weight - (tired.get(c.probe.provider.id) ?? 0);
-  return [...cands].sort((a, b) => {
-    const diff = score(b) - score(a);
-    if (diff !== 0) return diff;
-    if (a.rating !== b.rating) return b.rating - a.rating;
-    if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
-    return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
-  });
+/** Candidates best first: the rating, less what the next call to the provider is likely to cost
+ * (the headroom price, the reuse step and the load term, all divided by the request's weight), with
+ * a provider's first call held back when a later constrained request will need it, and a candidate
+ * that would spend past the trial's quality-loss budget sunk below every affordable one. Dead
+ * providers never appear. The order is a function of the brief, the requests and the providers'
+ * answers so far, so a replay leaves the same state export. */
+function sortCandidates(cands: readonly Candidate[], weight: number, top: number, rowIndex: number): Candidate[] {
+  const score = (c: Candidate): number => {
+    const providerId = c.probe.provider.id;
+    const made = calls.get(providerId) ?? 0;
+    const mid = BUDGET_MID[providerId] ?? 8;
+    let s = c.rating - (HEADROOM_K / Math.max(1, mid - made - 1) + (made > 0 ? REUSE_STEP : 0) + LOAD_PENALTY * made) / weight;
+    if (
+      rowIndex >= 0 &&
+      (servicers[rowIndex]?.size ?? 99) > CONSTRAINED_SERVICERS &&
+      made === 0 &&
+      (futureNeed[rowIndex]?.get(providerId) ?? 0) > 0
+    ) {
+      s -= SINK;
+    }
+    if (spentLoss + weight * (top - c.rating) > LOSS_CAP) s -= SINK;
+    return s;
+  };
+  return [...cands]
+    .filter((c) => !dead.has(c.probe.provider.id))
+    .sort((a, b) => {
+      const diff = score(b) - score(a);
+      if (diff !== 0) return diff;
+      if (a.rating !== b.rating) return b.rating - a.rating;
+      if (a.probe.provider.id !== b.probe.provider.id) return a.probe.provider.id < b.probe.provider.id ? -1 : 1;
+      return a.model.id < b.model.id ? -1 : a.model.id > b.model.id ? 1 : 0;
+    });
 }
 
-/** The requirements and weight of the request now arriving: the manifest's row by arrival order, else the body's own. */
-function requestPlan(body: Json, clientWire: 'openai' | 'anthropic'): { requires: Requirement; weight: number } {
+/** The requirements, weight and manifest row of the request now arriving: the manifest's row by
+ * arrival order, else the body's own (index -1, with no look-ahead). */
+function requestPlan(body: Json, clientWire: 'openai' | 'anthropic'): { requires: Requirement; weight: number; index: number } {
   const manifest = brief.workload?.manifest ?? [];
+  const index = manifestIndex;
   const entry = manifest[manifestIndex];
   manifestIndex += 1;
-  if (entry !== undefined) return { requires: entry.requires, weight: entry.weight };
-  return { requires: requirementsFromBody(body, clientWire), weight: 1 };
+  if (entry !== undefined) return { requires: entry.requires, weight: entry.weight, index };
+  return { requires: requirementsFromBody(body, clientWire), weight: 1, index: -1 };
 }
 
 function bodyTextOf(content: unknown): string {
@@ -386,6 +451,43 @@ function sendAnswer(res: ServerResponse, clientWire: 'openai' | 'anthropic', mod
   else sendJson(res, 200, anthropicJsonAnswer(model, answer));
 }
 
+/** The providers that can serve each manifest row, and what the later constrained rows still need:
+ * built once the probes are in, from the same candidates the requests will draw on. */
+function computeLookAhead(): void {
+  const manifest = brief.workload?.manifest ?? [];
+  servicers = manifest.map((row) => {
+    const jsonMode = row.api === 'openai' && row.requires.json === true;
+    return new Set(candidatesFor(row.requires, jsonMode).map((c) => c.probe.provider.id));
+  });
+  futureNeed = manifest.map((_, i) => {
+    const need = new Map<string, number>();
+    for (let j = i + 1; j < manifest.length; j++) {
+      if ((servicers[j]?.size ?? 99) > CONSTRAINED_SERVICERS) continue;
+      for (const providerId of servicers[j] ?? []) need.set(providerId, (need.get(providerId) ?? 0) + 1);
+    }
+    return need;
+  });
+}
+
+/** What a provider's refusal means, from its own error message: the env answers every refusal in
+ * the provider's wire with the provider's message — "<name>'s free-tier budget is spent",
+ * "<name> is out", "<name> refused this call" — so a spent budget or an outage is told apart from
+ * the one scheduled refusal of a single call. Anything else (an auth or model error, a timeout, a
+ * body that is not an error envelope) is transient: the provider stays live. */
+function refusalKind(text: string): 'budget' | 'outage' | 'fail' | 'other' {
+  try {
+    const parsed: unknown = JSON.parse(text);
+    if (!isRecord(parsed) || !isRecord(parsed.error) || typeof parsed.error.message !== 'string') return 'other';
+    const message = parsed.error.message;
+    if (message.includes('budget is spent')) return 'budget';
+    if (message.includes(' is out')) return 'outage';
+    if (message.includes('refused this call')) return 'fail';
+    return 'other';
+  } catch {
+    return 'other';
+  }
+}
+
 /** One client request: the best free model that meets it, with failover until one answers. */
 async function serve(clientWire: 'openai' | 'anthropic', body: Json, res: ServerResponse): Promise<void> {
   const stream = body.stream === true;
@@ -394,11 +496,11 @@ async function serve(clientWire: 'openai' | 'anthropic', body: Json, res: Server
   const jsonMode =
     clientWire === 'openai' && isRecord(body.response_format) && (body.response_format.type === 'json_object' || body.response_format.type === 'json_schema');
   const candidates = candidatesFor(requires, jsonMode);
-  const tired = new Map<string, number>();
+  const top = candidates.reduce((n, c) => Math.max(n, c.rating), 0);
   const tried = new Set<string>();
   let attempts = 0;
   for (;;) {
-    const next = sortCandidates(candidates, tired, plan.weight).find((c) => !tried.has(`${c.probe.provider.id}/${c.model.id}`));
+    const next = sortCandidates(candidates, plan.weight, top, plan.index).find((c) => !tried.has(`${c.probe.provider.id}/${c.model.id}`));
     if (next === undefined || attempts >= MAX_ATTEMPTS) break;
     tried.add(`${next.probe.provider.id}/${next.model.id}`);
     attempts += 1;
@@ -406,16 +508,23 @@ async function serve(clientWire: 'openai' | 'anthropic', body: Json, res: Server
     if (up.status >= 200 && up.status < 300) {
       const answer = parseAnswer(next.probe.provider.wire, stream, up.text);
       if (answer !== null && answer.text !== '') {
+        spentLoss += plan.weight * (top - next.rating);
         const stop = mapStop(next.probe.provider.wire, clientWire, answer.stop);
         log(`served a ${clientWire} request with ${next.probe.provider.id}/${next.model.id} (rating ${next.rating}, attempt ${attempts})`);
         sendAnswer(res, clientWire, next.model.id, stream, { ...answer, stop });
         return;
       }
+      log(`failover: ${next.probe.provider.id}/${next.model.id} answered HTTP ${up.status} with no usable answer; trying the next model`);
+      continue;
     }
-    // A refusal, a malformed answer or an unreachable provider: the request is answered with another
-    // model. This provider's other models sink for the rest of this request, but stay available.
-    tired.set(next.probe.provider.id, (tired.get(next.probe.provider.id) ?? 0) + FAIL_PENALTY);
-    log(`failover: ${next.probe.provider.id}/${next.model.id} answered HTTP ${up.status}; trying the next model`);
+    // A refusal: the provider's message says whether it is dead or just refused this one call.
+    const kind = refusalKind(up.text);
+    if (kind === 'budget' || kind === 'outage') {
+      dead.add(next.probe.provider.id);
+      log(`failover: ${next.probe.provider.id} is ${kind === 'budget' ? 'out of budget' : 'out'}; dead for the trial`);
+    } else {
+      log(`failover: ${next.probe.provider.id}/${next.model.id} refused this call (HTTP ${up.status}); trying the next model`);
+    }
   }
   sendError(res, clientWire, 503, clientWire === 'anthropic' ? 'overloaded_error' : 'service_unavailable', 'every free model that meets this request refused it');
 }
@@ -498,6 +607,7 @@ function poll(server: Server): void {
 
 async function start(): Promise<void> {
   await load();
+  computeLookAhead();
   if (process.argv.includes('--list')) {
     // The same document the register body carries, byte for byte: print the one built object and stop
     // before any server starts. A process whose stdout is not flushed loses the tail, so wait for it.
