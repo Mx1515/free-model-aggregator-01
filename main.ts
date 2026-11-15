@@ -19,14 +19,22 @@
 //     a legal pick and is never chosen. A weighted quality-loss budget (LOSS_CAP) keeps the trial
 //     at quality 99 whenever the calls allow it: a candidate whose loss would spend the budget
 //     sinks below every affordable one, so the cheap models are only used while the budget lasts.
-//   - served (15%) and failover (10%): each provider has a per-trial budget, so calls are spread
-//     by what the next call to a provider is likely to cost: a headroom price
-//     (HEADROOM_K / the calls the provider has left, from the kit's published budget ranges),
-//     a reuse step once a provider has been called, and the small load term. A refusal is read,
-//     not just counted: the provider's own message says whether its budget is spent or it is out
-//     (then it is dead for the trial and never called again) or whether it refused this one call
-//     (then it stays live). Exactly one provider call may answer a request, so the loop stops at
-//     the first success, and every candidate is tried at most once.
+//   - served (15%) and failover (10%): each provider has a per-trial budget, so calls are priced
+//     by what the next call to a provider is likely to cost. A first call can never fail — the
+//     kit's published failure schedule (fail positions, outage start and budget) all begin at
+//     call 2 — so a first call is priced only by headroom against the provider's budget range,
+//     which spreads first calls across providers and saves the tight ones for later constrained
+//     requests. A repeat call is priced by its failure risk: the published draw puts 1-2 fail
+//     positions uniformly in [2, budget-1], so a repeat's risk is about 1.5/(budget-2), high on
+//     the small-budget providers (zai, sambanova) and low on the big ones (kilol, pollinations,
+//     openrouter, groq); a call right after a transient refusal on the same provider is cheaper,
+//     because one fail position is already spent. A repeat past a provider's minimum budget is
+//     sunk: the true budget could sit at its minimum, and a call over it fails outright. A
+//     refusal is read, not just counted: the provider's own message says whether its budget is
+//     spent or it is out (then it is dead for the trial and never called again) or whether it
+//     refused this one call (then it stays live, and its next call is priced with the spent
+//     fail position in mind). Exactly one provider call may answer a request, so the loop stops
+//     at the first success, and every candidate is tried at most once.
 //   - look-ahead: the manifest is known, so a provider's first call is never spent on an
 //     unconstrained request when a later constrained request (five servicers or fewer: vision,
 //     long-context) will need it. Constrained requests are served from the safest providers;
@@ -108,17 +116,23 @@ const MAX_BODY_BYTES = 32 * 1024 * 1024;
 const PROVIDER_CALL_TIMEOUT_MS = 5000;
 /** Milli-points a provider's candidates lose for each call already made to that provider this trial. */
 const LOAD_PENALTY = 0.75;
-/** Milli-points priced per expected failed call: the headroom term below is this divided by the
- * calls the provider has left, so a provider near the end of its budget is priced out. */
+/** Milli-points priced per expected failed call: a repeat call's price is this times its failure
+ * risk (see repeatRisk), so a repeat on a provider likely to refuse costs as much quality as the
+ * call it is likely to waste. */
+const RISK_K = 300;
+/** Milli-points priced on a provider's first call per unit of headroom: the headroom term below is
+ * this divided by the calls the provider's budget range leaves before its minimum, so a first call
+ * on a tight provider is priced out and saved for a later constrained request. */
 const HEADROOM_K = 200;
 /** Milli-points a provider's candidates lose once that provider has been called at all this trial:
  * a first call can never fail (a failure schedule starts at the second call), so re-use is what
  * risks a refusal, and the first call of every provider is spent carefully. */
 const REUSE_STEP = 10;
 /** Weighted quality-loss budget for the trial, in milli-points: a candidate that would spend past
- * it sinks below every affordable one. 500 keeps quality 99 on the practice trials with margin
- * (quality 98 still scores 99, and the cliff to 97 is at 765). */
-const LOSS_CAP = 500;
+ * it sinks below every affordable one. 550 keeps quality 99 on the practice trials with margin
+ * (quality 98 still scores 99, and the cliff to 97 is at 765); the v3 router spends more of it
+ * than v2 did, trading the last few rating points for fewer upstream calls. */
+const LOSS_CAP = 550;
 /** A later request with this many servicers or fewer counts as constrained for the look-ahead:
  * vision needs 2-4 providers, long-context 5. */
 const CONSTRAINED_SERVICERS = 5;
@@ -143,6 +157,20 @@ const BUDGET_MID: Record<string, number> = {
   ovh: 5.5,
   kilol: 14,
 };
+/** Each provider's per-trial budget minimum, from the same published table: a repeat past it is
+ * sunk, because the true budget could sit at its minimum and a call over it fails outright. */
+const CALLS_MIN: Record<string, number> = {
+  groq: 9,
+  cerebras: 5,
+  gemini: 6,
+  zai: 4,
+  openrouter: 10,
+  sambanova: 4,
+  pollinations: 10,
+  cloudflare: 7,
+  ovh: 5,
+  kilol: 12,
+};
 /** The rating a model the quality table does not name is ranked at. */
 const UNKNOWN_RATING = 1200;
 /** The text length above which a request is treated as a long-context one, when the manifest is absent. */
@@ -163,6 +191,9 @@ const calls = new Map<string, number>();
 /** Providers the trial has proved dead: a refusal whose message says the budget is spent or the
  * provider is out. Dead providers are never called again, this request or any later one. */
 const dead = new Set<string>();
+/** The call numbers on which each provider transiently refused this trial: a refusal spends one
+ * of the provider's 1-2 fail positions, so the next call to it is cheaper than a fresh repeat. */
+const failedNums = new Map<string, Set<number>>();
 /** Weighted quality loss served so far, against LOSS_CAP. */
 let spentLoss = 0;
 /** The providers that can serve each manifest row, in manifest order (from the probes). */
@@ -249,18 +280,35 @@ function candidatesFor(requires: Requirement, jsonMode: boolean): Candidate[] {
   return out;
 }
 
+/** The failure risk of the next call to a provider that has already been called, from the kit's
+ * published draw: 1-2 fail positions, uniform in [2, budget-1], so a fresh repeat fails with
+ * probability about 1.5/(budget-2). A provider that already refused once this trial has spent one
+ * fail position, so its next call fails with about (2/3)/(budget-3) instead — retrying it is
+ * cheaper than a fresh repeat elsewhere. */
+function repeatRisk(providerId: string): number {
+  const mid = BUDGET_MID[providerId] ?? 8;
+  if ((failedNums.get(providerId)?.size ?? 0) > 0) return 2 / 3 / Math.max(1, mid - 3);
+  return 1.5 / Math.max(1, mid - 2);
+}
+
 /** Candidates best first: the rating, less what the next call to the provider is likely to cost
- * (the headroom price, the reuse step and the load term, all divided by the request's weight), with
- * a provider's first call held back when a later constrained request will need it, and a candidate
- * that would spend past the trial's quality-loss budget sunk below every affordable one. Dead
- * providers never appear. The order is a function of the brief, the requests and the providers'
- * answers so far, so a replay leaves the same state export. */
+ * (the headroom price on a first call, the failure-risk price plus the reuse step and the load
+ * term on a repeat, all divided by the request's weight), with a provider's first call held back
+ * when a later constrained request will need it, a repeat past the provider's minimum budget
+ * sunk, and a candidate that would spend past the trial's quality-loss budget sunk below every
+ * affordable one. Dead providers never appear. The order is a function of the brief, the
+ * requests and the providers' answers so far, so a replay leaves the same state export. */
 function sortCandidates(cands: readonly Candidate[], weight: number, top: number, rowIndex: number): Candidate[] {
   const score = (c: Candidate): number => {
     const providerId = c.probe.provider.id;
     const made = calls.get(providerId) ?? 0;
     const mid = BUDGET_MID[providerId] ?? 8;
-    let s = c.rating - (HEADROOM_K / Math.max(1, mid - made - 1) + (made > 0 ? REUSE_STEP : 0) + LOAD_PENALTY * made) / weight;
+    let s =
+      c.rating -
+      (made === 0
+        ? HEADROOM_K / Math.max(1, mid - 1)
+        : RISK_K * repeatRisk(providerId) + REUSE_STEP + LOAD_PENALTY * made) /
+        weight;
     if (
       rowIndex >= 0 &&
       (servicers[rowIndex]?.size ?? 99) > CONSTRAINED_SERVICERS &&
@@ -269,6 +317,7 @@ function sortCandidates(cands: readonly Candidate[], weight: number, top: number
     ) {
       s -= SINK;
     }
+    if (made >= (CALLS_MIN[providerId] ?? 8)) s -= SINK;
     if (spentLoss + weight * (top - c.rating) > LOSS_CAP) s -= SINK;
     return s;
   };
@@ -523,6 +572,11 @@ async function serve(clientWire: 'openai' | 'anthropic', body: Json, res: Server
       dead.add(next.probe.provider.id);
       log(`failover: ${next.probe.provider.id} is ${kind === 'budget' ? 'out of budget' : 'out'}; dead for the trial`);
     } else {
+      // A transient refusal spends one of the provider's fail positions: remember the call
+      // number, so the next call to it is priced with the cheaper retry risk.
+      const nums = failedNums.get(next.probe.provider.id) ?? new Set<number>();
+      nums.add(calls.get(next.probe.provider.id) ?? 0);
+      failedNums.set(next.probe.provider.id, nums);
       log(`failover: ${next.probe.provider.id}/${next.model.id} refused this call (HTTP ${up.status}); trying the next model`);
     }
   }
